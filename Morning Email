@@ -1,0 +1,270 @@
+$ErrorActionPreference = "Stop" #stop when an error is encountered
+# Declare variables
+$server = "YOURSERVER\YOURINSTANCE"
+$database = "master"
+$query = @"
+-- Services state
+USE [master]
+GO
+CREATE TABLE #ServiceState ([Id] INT IDENTITY(1, 1), [Status] VARCHAR(25), [ServiceName] VARCHAR(25))
+INSERT INTO #ServiceState([Status]) EXEC master.dbo.xp_servicecontrol 'QUERYSTATE', 'MSSQLServer'
+INSERT INTO #ServiceState([Status]) EXEC master.dbo.xp_servicecontrol 'QUERYSTATE', 'SQLServerAgent'
+INSERT INTO #ServiceState([Status]) EXEC master.dbo.xp_servicecontrol 'QUERYSTATE', 'SQLBrowser'
+UPDATE #ServiceState SET [ServiceName] = (CASE [Id] WHEN 1 THEN 'MSSQLServer' WHEN 2 THEN 'SQLServerAgent' WHEN 3 THEN 'SQLBrowser' END)
+SELECT [ServiceName], [Status] FROM #ServiceState
+DROP TABLE #ServiceState
+
+-- Agent jobs
+USE [msdb]
+GO
+
+CREATE TABLE #Info (
+   [JobId] UNIQUEIDENTIFIER, [Name] VARCHAR(128), [Description] VARCHAR(512), [Enabled] INT, [NotifyEmail] INT,
+   [NextRun] DATETIME, [SchedFreq] VARCHAR(128), [SubDayFreq] VARCHAR(128), [MaxStep] INT, [LastRunId] INT,
+   [LastRun] DATETIME, [PreviousRunId] INT, [LastDurationSeconds] INT, [LastRunFailedStepCount] INT, [LastStepRan] INT,
+   [AvgDurationSeconds] INT, [StdDevDurationSeconds] INT)
+
+INSERT INTO #Info ([JobId], [Name], [Description], [Enabled], [NotifyEmail],
+   [NextRun], [SchedFreq], [SubDayFreq], [MaxStep])
+SELECT [j].[job_id], [j].[name], [j].[description], [s].[enabled], [j].[notify_level_email],
+      [dbo].[agent_datetime](CASE WHEN [js].[next_run_date] <> 0 THEN [js].[next_run_date] ELSE [s].[active_start_date] END,
+                       CASE WHEN [js].[next_run_time] <> 0 THEN [js].[next_run_time] ELSE [s].[active_start_time] END),
+      CASE [s].[freq_type] WHEN 1 THEN 'Once'
+                     WHEN 4 THEN 'Daily'
+                     WHEN 8 THEN 'Weekly'
+                     WHEN 16 THEN 'Monthly'
+                     WHEN 32 THEN 'Monthly relative'
+                     WHEN 64 THEN 'When agent starts'
+                     WHEN 128 THEN 'When computer idle' END,
+      CASE [s].[freq_subday_interval]
+         WHEN 0 THEN 'Once'
+         ELSE 'Every ' + RIGHT([s].[freq_subday_interval], 2) +
+            (CASE [s].[freq_subday_type]
+               WHEN 1 THEN ' Once'
+               WHEN 2 THEN ' Seconds'
+               WHEN 4 THEN ' Minutes'
+               WHEN 8 THEN ' Hours' END) END,
+       (SELECT MAX([step_id]) FROM [sysjobsteps] [st] WHERE [st].[job_id] = [j].[job_id]) [MaxStep]
+  FROM [sysjobs] [j]
+LEFT JOIN [sysjobschedules] [js] ON [js].[job_id] = [j].[job_id]
+LEFT JOIN [sysschedules] [s] ON [s].[schedule_id] = [js].[schedule_id]
+ WHERE [j].[enabled] = 1
+
+UPDATE [i]
+   SET [i].[LastRunId] = [h].[instance_id],
+       [i].[LastRun] = [dbo].[agent_datetime]([h].[run_date], [h].[run_time])
+  FROM #Info [i]
+INNER JOIN [sysjobhistory] [h] ON [h].[instance_id] = (SELECT MAX([instance_id]) FROM [sysjobhistory] [h2] WHERE [h2].[job_id] = [i].[JobId] AND [h2].[step_id] = 0)
+
+UPDATE [i]
+   SET [i].[PreviousRunId] = (SELECT MAX([instance_id]) FROM [sysjobhistory] [h] WHERE [h].[job_id] = [i].[JobId] AND [h].[step_id] = 0 AND [h].[instance_id] < [i].[LastRunId])
+  FROM #Info [i]
+
+UPDATE [i]
+   SET [i].[LastDurationSeconds] = [t].[LastDurationSeconds],
+       [i].[LastRunFailedStepCount] = [t].[LastRunFailedStepCount],
+      [i].[LastStepRan] = [t].[LastStepRan]
+  FROM #Info [i]
+INNER JOIN (
+   SELECT [h].[job_id], SUM(CASE WHEN [h].[run_status] NOT IN (1, 2, 4) THEN 1 ELSE 0 END) [LastRunFailedStepCount],
+          SUM(CASE WHEN [h].[run_status] = 1 AND [h].[run_duration] > 0 THEN [h].[run_duration]/10000*3600 + ([h].[run_duration]/100)%100*60 + [h].[run_duration]%100 ELSE 0 END) [LastDurationSeconds],
+         MAX([step_id]) [LastStepRan]
+     FROM [sysjobhistory] [h]
+   INNER JOIN #Info [i] ON [i].[JobId] = [h].[job_id] AND [h].[instance_id] > [i].[PreviousRunId] AND [h].[instance_id] < [i].[LastRunId]
+   GROUP BY [h].[job_id]) [t] ON [t].[job_id] = [i].[JobId]
+
+UPDATE [i]
+   SET [i].[AvgDurationSeconds] = ISNULL(CASE [t].[AvgDurationSeconds] WHEN 0 THEN 1 ELSE [t].[AvgDurationSeconds] END, 1),
+       [i].[StdDevDurationSeconds] = ISNULL(CASE [t].[StdDevDurationSeconds] WHEN 0 THEN 1 ELSE [t].[StdDevDurationSeconds] END, 1)
+  FROM #Info [i]
+INNER JOIN (
+   SELECT [job_id],
+          AVG([run_duration]/10000*3600 + ([run_duration]/100)%100*60 + [run_duration]%100) [AvgDurationSeconds],
+          STDEV([run_duration]/10000*3600 + ([run_duration]/100)%100*60 + [run_duration]%100) [StdDevDurationSeconds]
+     FROM [sysjobhistory]
+    WHERE [step_id] <> 0
+      AND [run_status] = 1
+      AND [run_duration] >= 0
+   GROUP BY [job_id]) [t] ON [t].[job_id] = [i].[JobId]
+
+SELECT [Name], [Description], [LastRun], [Enabled], [SchedFreq], [SubDayFreq], [NextRun], [LastDurationSeconds], [MaxStep], [LastStepRan],
+       (CASE WHEN [LastRunFailedStepCount] > 0 THEN 'One or more steps failed'
+             WHEN [LastStepRan] < [MaxStep] THEN 'One or more steps did not run'
+            WHEN [NextRun] IS NULL THEN 'Not going to run'
+          WHEN [NotifyEmail] = 0 THEN 'Not alerting by email'
+          ELSE '' END) [Message],
+       (CASE WHEN [LastDurationSeconds] < ([AvgDurationSeconds] - ISNULL([StdDevDurationSeconds], 0))
+              OR [LastDurationSeconds] > ([AvgDurationSeconds] + ISNULL([StdDevDurationSeconds], 0))
+            THEN CAST([LastDurationSeconds]/[AvgDurationSeconds] AS VARCHAR)+' times average'
+          ELSE 'Within average' END) [TimeToComplete],
+      (CASE WHEN [NextRun] IS NULL THEN '' ELSE 'USE [msdb]; SELECT TOP 10 [step_id], [message], [run_status], [dbo].[agent_datetime]([run_date], [run_time]) [DateTime], [run_duration] FROM [sysjobhistory] WHERE [job_id] = '''+CAST([JobId] AS NVARCHAR(50))+''' ORDER BY [instance_id] DESC' END) [AdditionalInfo]
+  FROM #Info
+ WHERE ([LastDurationSeconds] > 15
+        AND ([LastDurationSeconds] < ([AvgDurationSeconds] - ISNULL([StdDevDurationSeconds], 0))
+          OR [LastDurationSeconds] > ([AvgDurationSeconds] + ISNULL([StdDevDurationSeconds], 0))))
+   OR [LastRunFailedStepCount] > 0
+   OR [NextRun] IS NULL
+   OR [NotifyEmail] = 0
+   OR [LastStepRan] < [MaxStep]
+ORDER BY [Name]
+
+DROP TABLE #Info
+
+-- Backup status
+USE [msdb]
+GO
+SELECT d.name AS "Database",
+       ISNULL(CONVERT(VARCHAR,b.backupdate,120),'NEVER') AS "Last Full Backup"
+FROM sys.databases d
+LEFT JOIN (SELECT database_name,type,MAX(backup_finish_date) backupdate FROM backupset
+           WHERE type LIKE 'D'
+           GROUP BY database_name,type) b on d.name=b.database_name
+WHERE (backupdate IS NULL OR backupdate < getdate()-1)
+
+-- Error log
+USE [master]
+GO
+EXEC [dbo].[usp_ErrorLogRead]
+
+-- Low disk space
+USE [master]
+GO
+exec dbo.xp_fixeddrives
+
+-- Available memory
+USE [master]
+GO
+SELECT available_physical_memory_kb/1024 as "Total Memory MB",
+       available_physical_memory_kb/(total_physical_memory_kb*1.0)*100 AS "% Memory Free"
+FROM sys.dm_os_sys_memory
+
+-- Queries needing tuning
+USE [master]
+GO
+SELECT top 10 text as "SQL Statement",
+   last_execution_time as "Last Execution Time",
+   (total_logical_reads+total_physical_reads+total_logical_writes)/execution_count as [Average IO],
+   (total_worker_time/execution_count)/1000000.0 as [Average CPU Time (sec)],
+   (total_elapsed_time/execution_count)/1000000.0 as [Average Elapsed Time (sec)],
+   execution_count as "Execution Count",
+   qp.query_plan as "Query Plan"
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.plan_handle) st
+CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
+order by total_elapsed_time/execution_count desc
+
+-- Current connections
+USE [master]
+GO
+SELECT spid, kpid, blocked, d.name, open_tran, status, hostname,
+cmd, login_time, loginame, net_library
+FROM sys.sysprocesses p
+INNER JOIN sys.databases d 
+ on p.dbid=d.database_id
+
+ -- Requests processing
+USE [master]
+GO
+DECLARE @BRPS BIGINT
+SELECT @BRPS=cntr_value 
+FROM sys.dm_os_performance_counters
+WHERE counter_name LIKE 'Batch Requests/sec%'
+WAITFOR DELAY '000:00:10'
+SELECT (cntr_value-@BRPS)/10.0 AS "Batch Requests/Sec"
+FROM sys.dm_os_performance_counters
+WHERE counter_name LIKE 'Batch Requests/sec%'
+"@
+$querytimeout = 0 #0 means forever, change it as needed
+$filter = @()
+$columns = @()
+$excludeColumns = @()
+$titles = @()
+# Here you need to add: filter, columns to retrieve, columns to exclude, and title. This needs to be done for each result table, in the order returned.
+$titles += "Services state"
+$filter += {1 -eq 1}
+$columns += ,'*'
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$titles += "Agent jobs with issues"
+$filter += {1 -eq 1}
+$columns += ,'*'
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$titles += "Last full backups"
+$filter += {1 -eq 1}
+$columns += ,'*'
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$titles += "Latest entries from error log"
+$filter += {1 -eq 1}
+$columns += ,'*'
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$titles += "Free space"
+$filter += {1 -eq 1}
+$columns += ,'*'
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$titles += "Free memory"
+$filter += {1 -eq 1}
+$columns += ,'*'
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$titles += "Queries needing tuning"
+$filter += {1 -eq 1}
+$columns += ,'*'
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$titles += "Current connections"
+$filter += {1 -eq 1}
+$columns += ,'*'
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$titles += "Requests being processed"
+$filter += {1 -eq 1}
+$columns += ,@('*', ' ')
+$excludeColumns += ,@('RowError, RowState, Table, ItemArray, HasErrors' -split ", ")
+$numberOfHeaderRowsToSkip = 1 #for applying the odd/even style to the table
+$date = Get-Date
+$reportBody = "<h4>Report as of $date</h4>"
+$mailServer = "YOURSMTPSERVER"
+$mailFrom = "from@domain.com"
+$mailTo = "to@domain.com"
+$mailSubject = "$server Daily monitoring"
+$reportHeader = "<style>
+th {border:solid black 1px; border-collapse:collapse; padding-left:5px; padding-right:5px; padding-top:1px; padding-bottom:1px; background-color:white;}
+td {border:solid black 1px; border-collapse:collapse; padding-left:5px; padding-right:5px; padding-top:1px; padding-bottom:1px; color:black; vertical-align: top;}
+tr.even {background-color:#D3D3D3;}</style>"
+# Import modules
+Import-Module SqlPs -DisableNameChecking #uncomment for running it directly in a ps command prompt
+# Run query
+$result = (Invoke-Sqlcmd -ServerInstance $server -Database $database -Query $query -querytimeout $querytimeout)
+if ($result -eq $NULL -or $result.count -eq 0) {
+  exit #if there are no rows, no report is sent and the job completes successfully
+}
+$tablesFirstRow = @()
+$tablesFirstRow += 0
+$tablesLastRow = 0
+for ($i=0; $i -lt $result.length; $i++) {
+   if (-Not $result[$i].Table.Equals($result[$tablesLastRow].Table)) {
+      $tablesFirstRow += $i
+      $tablesLastRow = $i
+   }
+}
+$tablesFirstRow += $result.length
+for ($j=0; $j -lt $tablesFirstRow.length-1; $j++) {
+   $firstRow = $tablesFirstRow[$j]
+   $lastRow = $tablesFirstRow[$j+1]
+   $tmpResult = @()
+   for ($i=$firstRow; $i -lt $lastRow; $i++) {
+      $tmpResult += $result[$i]
+   }
+   # apply filtering, convert to HTML with custom header and body
+   [string]$innerResult = $tmpResult | where $filter[$j] | select $columns[$j] -ExcludeProperty $excludeColumns[$j] | ConvertTo-HTML -Fragment | Out-String
+   [xml]$innerResult = $innerResult.Replace("`0", "") #remove invalid characters that conflict with XML
+   for ($i = 0; $i -lt $innerResult.table.tr.count - $numberOfHeaderRowsToSkip; $i++) {
+     $class = $innerResult.CreateAttribute("class")
+     $class.value = if($i % 2 -eq 0) {"even"} else {"odd"}
+     $innerResult.table.tr[$i+$numberOfHeaderRowsToSkip].attributes.append($class) | Out-Null
+   }
+   $reportBody += "<br/><b>" + $titles[$j] + "</b><br/>" + $innerResult.InnerXml
+}
+# Send report
+$message = New-Object System.Net.Mail.MailMessage $mailFrom, $mailTo
+$message.Subject = $mailSubject
+$message.IsBodyHTML = $true
+$message.Body = ConvertTo-HTML -head $reportHeader -body $reportBody
+$smtp = New-Object Net.Mail.SmtpClient($mailServer)
+$smtp.Send($message)
