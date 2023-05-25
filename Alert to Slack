@@ -1,0 +1,16 @@
+DROP PROCEDURE IF EXISTS AlertToSlack
+GO
+
+CREATE PROCEDURE AlertToSlack @message_txt varchar(4000), @slack_channel varchar(256)
+AS
+BEGIN
+EXEC sp_execute_external_script @language =N'Python',
+@script=N'
+from slacker import Slacker
+slack = Slacker(<put here your slack id>)
+slack.chat.post_message(slack_channel_in, message_txt_in)
+',
+@params = N'@message_txt_in varchar(4000), @slack_channel_in varchar(256)',
+@message_txt_in = @message_txt,
+@slack_channel_in = @slack_channel
+END			
