@@ -1,0 +1,67 @@
+-- Check database backups
+USE master;
+EXEC sp_BackupDatabases;
+
+-- Check database integrity
+DBCC CHECKDB ('YourDatabaseName') WITH NO_INFOMSGS;
+
+-- Check SQL Server Agent jobs
+USE msdb;
+EXEC sp_help_job;
+
+-- Check SQL Server error log for recent errors
+EXEC xp_readerrorlog 0, 1, N'error';
+
+-- Check disk space usage
+EXEC xp_fixeddrives;
+
+-- Check database space usage
+USE YourDatabaseName;
+EXEC sp_spaceused;
+
+-- Check SQL Server version and edition
+SELECT SERVERPROPERTY('ProductVersion') AS 'Version', SERVERPROPERTY('Edition') AS 'Edition';
+
+-- Check blocked processes
+SELECT 
+    L.request_session_id AS 'SPID',
+    L.blocking_session_id AS 'BlockedBySPID',
+    DB_NAME(L.database_id) AS 'Database',
+    O.name AS 'ObjectName',
+    P.[object_id] AS 'ObjectID',
+    L.resource_type AS 'Resource',
+    L.request_mode AS 'Mode',
+    ST.text AS 'SQLText'
+FROM sys.dm_tran_locks L
+JOIN sys.partitions P ON P.[hobt_id] = L.resource_associated_entity_id
+JOIN sys.objects O ON O.[object_id] = P.[object_id]
+CROSS APPLY sys.dm_exec_sql_text(L.sql_handle) AS ST
+WHERE L.request_session_id > 0;
+
+-- Check long-running queries
+USE YourDatabaseName;
+SELECT 
+    r.session_id AS 'SPID',
+    r.start_time AS 'StartTime',
+    s.text AS 'SQLText'
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS s
+WHERE r.status = 'running';
+
+-- Check server memory usage
+SELECT 
+    (physical_memory_in_use_kb / 1024) AS 'MemoryUsed_MB',
+    (locked_page_allocations_kb / 1024) AS 'LockedPagesUsed_MB',
+    (total_virtual_address_space_kb / 1024) AS 'TotalVASpace_MB',
+    process_physical_memory_low,
+    process_virtual_memory_low
+FROM sys.dm_os_process_memory;
+
+-- Check server CPU usage
+SELECT 
+    cpu_count AS 'TotalCPUs',
+    hyperthread_ratio AS 'HyperthreadRatio',
+    cpu_count/hyperthread_ratio AS 'PhysicalCPUs',
+    max_worker_count AS 'MaxWorkers',
+    idle_scheduler_count AS 'IdleSchedulers'
+FROM sys.dm_os_sys_info;
